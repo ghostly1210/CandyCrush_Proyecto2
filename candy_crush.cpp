@@ -4,37 +4,26 @@
  *  Proyecto 2 - Fases 2 y 3
  *  Universidad del Valle de Guatemala
  *
- *  Implementación con:
- *    - POSIX Threads (pthreads)
- *    - Mutex para acceso al tablero compartido
- *    - Variables de condición para sincronización
- *    - Semáforos para control de turnos
- *    - ASCII-Art para visualización en consola
- * ============================================================
- *
  *  HILOS INDEPENDIENTES:
- *    1. thread_input       – Captura teclas del jugador
- *    2. thread_match       – Detecta combinaciones en el tablero
- *    3. thread_score       – Calcula y acumula el puntaje
- *    4. thread_render      – Redibuja el tablero en consola
- *    5. thread_gravity     – Hace caer dulces al haber huecos
- *    6. thread_refill      – Rellena la fila superior con nuevos dulces
+ *    1. thread_input    – Captura teclas del jugador
+ *    2. thread_match    – Detecta combinaciones en el tablero
+ *    3. thread_score    – Acumula el puntaje
+ *    4. thread_render   – Redibuja el tablero en consola
+ *    5. thread_gravity  – Hace caer dulces al haber huecos
+ *    6. thread_refill   – Rellena con nuevos dulces
  *
- *  MECANISMOS DE SINCRONIZACIÓN:
- *    - mutex_board         – Protege el tablero compartido
- *    - mutex_score         – Protege la variable de puntaje
- *    - mutex_state         – Protege el estado global del juego
- *    - cond_match_ready    – Señala que hay combinaciones listas
- *    - cond_gravity_ready  – Señala que hay huecos para aplicar gravedad
- *    - sem_render          – Controla frecuencia de renderizado
+ *  SINCRONIZACIÓN:
+ *    - mutex_board  : protege el tablero
+ *    - mutex_game   : protege todo el estado (score, moves, flags)
+ *    - cond_match   : señala nuevas combinaciones al hilo score
+ *    - cond_gravity : señala huecos al hilo gravedad
+ *    - sem_render   : despierta el hilo de render
  * ============================================================
  */
 
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <sstream>
-#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -45,323 +34,257 @@
 
 using namespace std;
 
-// ============================================================
-//  CONSTANTES
-// ============================================================
-#define BOARD_ROWS   8
-#define BOARD_COLS   8
-#define NUM_CANDIES  5       // tipos de dulces en modo fácil
-#define NUM_CANDIES_H 7      // tipos en modo difícil
+// ── Dimensiones y reglas ────────────────────────────────────
+#define ROWS        8
+#define COLS        8
+#define SCORE_GOAL  100
 #define EASY_MOVES  20
 #define HARD_MOVES  12
-#define SCORE_GOAL  100
-#define SCOREBOARD  "scoreboard.txt"
+#define SCOREFILE   "scoreboard.txt"
 
-// Colores ANSI
-#define RESET   "\033[0m"
-#define BOLD    "\033[1m"
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
-#define MAGENTA "\033[35m"
-#define CYAN    "\033[36m"
-#define WHITE   "\033[37m"
-#define BG_BLACK "\033[40m"
+// ── Colores ANSI ─────────────────────────────────────────────
+#define RST   "\033[0m"
+#define BOLD  "\033[1m"
+#define C_RED "\033[31m"
+#define C_GRN "\033[32m"
+#define C_YEL "\033[33m"
+#define C_BLU "\033[34m"
+#define C_MAG "\033[35m"
+#define C_CYN "\033[36m"
+#define C_WHT "\033[37m"
 
-// Dulces representados con caracteres ASCII
-// Índice: 0=@(azul) 1=#(verde) 2=$(amarillo) 3=%(rojo) 4=&(magenta) 5=!(cyan) 6=*(blanco)
-const char  CANDY_CHAR[]  = { '@', '#', '$', '%', '&', '!', '*' };
-const char* CANDY_COLOR[] = { BLUE, GREEN, YELLOW, RED, MAGENTA, CYAN, WHITE };
+// ── Dulces ───────────────────────────────────────────────────
+#define N_CANDY_EASY 5
+#define N_CANDY_HARD 7
+static const char  CSYM[]  = { '@','#','$','%','&','!','*' };
+static const char* CCOL[]  = { C_BLU,C_GRN,C_YEL,C_RED,C_MAG,C_CYN,C_WHT };
+#define SPC_CANDY 'X'   // dulce especial
+#define EMPTY     ' '
 
-// Dulce especial (generado con combo >=4)
-#define SPECIAL_CANDY 8
-#define SPECIAL_CHAR  'X'
-
-// Teclas
-#define KEY_UP    'w'
-#define KEY_DOWN  's'
-#define KEY_LEFT  'a'
-#define KEY_RIGHT 'd'
-#define KEY_SELECT ' '   // Espacio selecciona/confirma
-#define KEY_QUIT  'q'
+// ── Teclas ───────────────────────────────────────────────────
+#define K_UP    'w'
+#define K_DOWN  's'
+#define K_LEFT  'a'
+#define K_RIGHT 'd'
+#define K_SEL   ' '
+#define K_QUIT  'q'
 
 // ============================================================
-//  ESTADO GLOBAL DEL JUEGO
+//  ESTADO GLOBAL  (un solo mutex lo protege todo excepto board)
 // ============================================================
-typedef struct {
-    char board[BOARD_ROWS][BOARD_COLS];   // tablero principal
-    bool marked[BOARD_ROWS][BOARD_COLS];  // celdas marcadas para eliminar
-    bool holes[BOARD_ROWS][BOARD_COLS];   // huecos detectados
-    int  cursor_r, cursor_c;              // posición del cursor
-    int  sel_r,    sel_c;                 // celda seleccionada (-1 si ninguna)
-    bool selected;                        // hay celda seleccionada
-    int  score;                           // puntaje actual
-    int  moves;                           // movimientos restantes
-    int  mode;                            // 1=fácil, 2=difícil
-    int  num_candy_types;
-    bool game_over;
-    bool player_won;
-    bool running;                         // hilo principal corriendo
-    bool match_pending;                   // hay combinaciones por procesar
-    bool gravity_pending;                 // hay huecos por llenar
-    bool refill_pending;                  // hay que rellenar fila superior
-    int  pending_score;                   // puntaje por confirmar al hilo score
-    char player_name[64];
-} GameState;
+static char board[ROWS][COLS];
+static bool marked[ROWS][COLS];
 
-GameState G;
+static int  g_score        = 0;
+static int  g_moves        = 0;
+static int  g_pending_pts  = 0;   // puntos generados por match, aún no sumados
+static bool g_running      = true;
+static bool g_game_over    = false;
+static bool g_won          = false;
+static bool g_match_ready  = false;  // señal: hay pts pendientes para score
+static bool g_need_gravity = false;  // señal: hay huecos
+static bool g_need_refill  = false;  // señal: hay que rellenar
 
-// ============================================================
-//  PRIMITIVAS DE SINCRONIZACIÓN
-// ============================================================
-pthread_mutex_t mutex_board  = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_score  = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_state  = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t  cond_match_ready   = PTHREAD_COND_INITIALIZER;
-pthread_cond_t  cond_gravity_ready = PTHREAD_COND_INITIALIZER;
-sem_t           sem_render;
+static int  g_cr = 0, g_cc = 0;     // cursor
+static int  g_sr = -1, g_sc = -1;   // celda seleccionada
+static bool g_selected = false;
 
-// ============================================================
-//  UTILIDADES DE TERMINAL
-// ============================================================
+static int  g_mode       = 1;
+static int  g_ncandy     = N_CANDY_EASY;
+static char g_name[64]   = "Jugador";
 
-/* Desactiva el modo canonical (entrada carácter a carácter, sin eco) */
-static struct termios orig_termios;
+// ── Primitivas ───────────────────────────────────────────────
+static pthread_mutex_t mutex_board = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mutex_game  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  cond_match  = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  cond_grav   = PTHREAD_COND_INITIALIZER;
+static sem_t           sem_render;
 
-void term_raw_mode() {
-    tcgetattr(STDIN_FILENO, &orig_termios);
-    struct termios raw = orig_termios;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 1;   // timeout 0.1 s
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+// ── Terminal ─────────────────────────────────────────────────
+static struct termios orig_term;
+
+void term_raw() {
+    tcgetattr(STDIN_FILENO, &orig_term);
+    struct termios t = orig_term;
+    t.c_lflag &= ~(ICANON | ECHO);
+    t.c_cc[VMIN]  = 0;
+    t.c_cc[VTIME] = 1;   // read timeout 0.1 s → nunca bloquea para siempre
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
 }
 
-void term_restore() {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-}
-
-void clear_screen()   { printf("\033[H\033[2J"); fflush(stdout); }
-void hide_cursor()    { printf("\033[?25l"); fflush(stdout); }
-void show_cursor()    { printf("\033[?25h"); fflush(stdout); }
-void move_cursor(int r, int c) { printf("\033[%d;%dH", r, c); fflush(stdout); }
+void term_restore() { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term); }
+void clrscr()  { printf("\033[H\033[2J"); fflush(stdout); }
+void hidecur() { printf("\033[?25l");     fflush(stdout); }
+void showcur() { printf("\033[?25h");     fflush(stdout); }
+void gotoxy(int r, int c) { printf("\033[%d;%dH", r, c); fflush(stdout); }
 
 // ============================================================
-//  FUNCIONES DEL TABLERO
+//  TABLERO
 // ============================================================
+static char rand_candy() { return CSYM[rand() % g_ncandy]; }
 
-/* Genera un tipo de dulce aleatorio (0..num_types-1), evitando triple inmediato */
-char rand_candy(int num_types) {
-    int c = rand() % num_types;
-    return CANDY_CHAR[c];
-}
-
-/* Inicializa el tablero sin combinaciones iniciales */
-void init_board(int num_types) {
-    for (int i = 0; i < BOARD_ROWS; i++) {
-        for (int j = 0; j < BOARD_COLS; j++) {
+static void init_board() {
+    for (int i = 0; i < ROWS; i++)
+        for (int j = 0; j < COLS; j++) {
             char c;
-            int attempts = 0;
+            int  tries = 0;
             do {
-                c = rand_candy(num_types);
-                attempts++;
-                // Evitar 3 en fila horizontal
-                bool h = (j >= 2 &&
-                          G.board[i][j-1] == c &&
-                          G.board[i][j-2] == c);
-                // Evitar 3 en columna
-                bool v = (i >= 2 &&
-                          G.board[i-1][j] == c &&
-                          G.board[i-2][j] == c);
+                c = rand_candy();
+                bool h = (j>=2 && board[i][j-1]==c && board[i][j-2]==c);
+                bool v = (i>=2 && board[i-1][j]==c && board[i-2][j]==c);
                 if (!h && !v) break;
-            } while (attempts < 20);
-            G.board[i][j] = c;
+            } while (++tries < 20);
+            board[i][j] = c;
         }
-    }
-}
-
-/* Devuelve el índice del tipo de dulce según su carácter, -1 si no encontrado */
-int candy_index(char c) {
-    if (c == SPECIAL_CHAR) return -2;   // especial
-    for (int i = 0; i < 7; i++)
-        if (CANDY_CHAR[i] == c) return i;
-    return -1;
-}
-
-/* Intercambia dos celdas del tablero (requiere mutex_board bloqueado) */
-void swap_cells(int r1, int c1, int r2, int c2) {
-    char tmp = G.board[r1][c1];
-    G.board[r1][c1] = G.board[r2][c2];
-    G.board[r2][c2] = tmp;
 }
 
 // ============================================================
-//  HILO 3: CÁLCULO DE PUNTAJE
-//  Espera señal de match_ready y suma los puntos pendientes.
+//  HILO 3: PUNTAJE
+//  Espera cond_match, suma g_pending_pts, verifica victoria.
 // ============================================================
-void* thread_score_fn(void* arg) {
+static void* thread_score_fn(void*) {
     while (true) {
-        // Espera que haya puntaje pendiente
-        pthread_mutex_lock(&mutex_state);
-        while (!G.match_pending && G.running)
-            pthread_cond_wait(&cond_match_ready, &mutex_state);
-        if (!G.running) {
-            pthread_mutex_unlock(&mutex_state);
+        pthread_mutex_lock(&mutex_game);
+        // Esperar hasta que haya puntos pendientes O el juego termine
+        while (!g_match_ready && g_running)
+            pthread_cond_wait(&cond_match, &mutex_game);
+
+        if (!g_running && !g_match_ready) {
+            pthread_mutex_unlock(&mutex_game);
             break;
         }
-        int pts = G.pending_score;
-        G.pending_score = 0;
-        pthread_mutex_unlock(&mutex_state);
+
+        int pts       = g_pending_pts;
+        g_pending_pts = 0;
+        g_match_ready = false;
+        pthread_mutex_unlock(&mutex_game);
 
         if (pts > 0) {
-            pthread_mutex_lock(&mutex_score);
-            G.score += pts;
-            pthread_mutex_unlock(&mutex_score);
+            pthread_mutex_lock(&mutex_game);
+            g_score += pts;
+            // ── Comprobar victoria ──────────────────────────
+            if (!g_game_over && g_score >= SCORE_GOAL) {
+                g_won      = true;
+                g_game_over= true;
+                g_running  = false;
+                // Despertar hilos bloqueados en cond_*
+                pthread_cond_broadcast(&cond_match);
+                pthread_cond_broadcast(&cond_grav);
+            }
+            pthread_mutex_unlock(&mutex_game);
+            sem_post(&sem_render);
         }
-        usleep(10000);
     }
     return NULL;
 }
 
 // ============================================================
 //  HILO 2: DETECCIÓN DE COMBINACIONES
-//  Escanea el tablero y marca las celdas a eliminar.
 // ============================================================
-void* thread_match_fn(void* arg) {
+static void* thread_match_fn(void*) {
     while (true) {
-        pthread_mutex_lock(&mutex_state);
-        if (!G.running) {
-            pthread_mutex_unlock(&mutex_state);
-            break;
-        }
-        pthread_mutex_unlock(&mutex_state);
+        pthread_mutex_lock(&mutex_game);
+        bool alive = g_running;
+        pthread_mutex_unlock(&mutex_game);
+        if (!alive) break;
 
         pthread_mutex_lock(&mutex_board);
+        memset(marked, 0, sizeof(marked));
+        int pts   = 0;
+        bool found= false;
 
-        bool found = false;
-        int  pts   = 0;
-        memset(G.marked, 0, sizeof(G.marked));
-
-        // Horizontal: 3 o más
-        for (int i = 0; i < BOARD_ROWS; i++) {
-            for (int j = 0; j < BOARD_COLS - 2; j++) {
-                char c = G.board[i][j];
-                if (c == ' ') continue;
+        // Horizontal
+        for (int i = 0; i < ROWS; i++)
+            for (int j = 0; j < COLS-2; ) {
+                char c = board[i][j];
+                if (c == EMPTY) { j++; continue; }
                 int len = 1;
-                while (j + len < BOARD_COLS && G.board[i][j+len] == c) len++;
+                while (j+len < COLS && board[i][j+len] == c) len++;
                 if (len >= 3) {
-                    for (int k = 0; k < len; k++)
-                        G.marked[i][j+k] = true;
-                    pts  += len * 10;
-                    found = true;
-                    // Dulce especial si combo >=4
-                    if (len >= 4)
-                        G.board[i][j + len/2] = SPECIAL_CHAR;
-                    j += len - 1;
+                    for (int k=0;k<len;k++) marked[i][j+k]=true;
+                    pts += len*10; found = true;
+                    if (len >= 4) board[i][j+len/2] = SPC_CANDY;
                 }
+                j += len;
             }
-        }
 
-        // Vertical: 3 o más
-        for (int j = 0; j < BOARD_COLS; j++) {
-            for (int i = 0; i < BOARD_ROWS - 2; i++) {
-                char c = G.board[i][j];
-                if (c == ' ') continue;
+        // Vertical
+        for (int j = 0; j < COLS; j++)
+            for (int i = 0; i < ROWS-2; ) {
+                char c = board[i][j];
+                if (c == EMPTY) { i++; continue; }
                 int len = 1;
-                while (i + len < BOARD_ROWS && G.board[i+len][j] == c) len++;
+                while (i+len < ROWS && board[i+len][j] == c) len++;
                 if (len >= 3) {
-                    for (int k = 0; k < len; k++)
-                        G.marked[i+k][j] = true;
-                    pts  += len * 10;
-                    found = true;
-                    if (len >= 4)
-                        G.board[i + len/2][j] = SPECIAL_CHAR;
-                    i += len - 1;
+                    for (int k=0;k<len;k++) marked[i+k][j]=true;
+                    pts += len*10; found = true;
+                    if (len >= 4) board[i+len/2][j] = SPC_CANDY;
                 }
+                i += len;
             }
-        }
 
-        // Eliminar celdas marcadas
+        // Eliminar marcadas
         if (found) {
-            for (int i = 0; i < BOARD_ROWS; i++)
-                for (int j = 0; j < BOARD_COLS; j++)
-                    if (G.marked[i][j])
-                        G.board[i][j] = ' ';
+            for (int i=0;i<ROWS;i++)
+                for (int j=0;j<COLS;j++)
+                    if (marked[i][j]) board[i][j] = EMPTY;
 
-            // Activar dulces especiales (eliminan fila completa)
-            for (int i = 0; i < BOARD_ROWS; i++) {
-                for (int j = 0; j < BOARD_COLS; j++) {
-                    if (G.board[i][j] == SPECIAL_CHAR) {
-                        // elimina toda la fila
-                        for (int k = 0; k < BOARD_COLS; k++)
-                            G.board[i][k] = ' ';
-                        pts += BOARD_COLS * 5;
+            // Activar dulces especiales (eliminan su fila entera)
+            for (int i=0;i<ROWS;i++)
+                for (int j=0;j<COLS;j++)
+                    if (board[i][j] == SPC_CANDY) {
+                        for (int k=0;k<COLS;k++) board[i][k] = EMPTY;
+                        pts += COLS*5;
                     }
-                }
-            }
+        }
+        pthread_mutex_unlock(&mutex_board);
 
-            pthread_mutex_unlock(&mutex_board);
-
-            // Notifica al hilo de puntaje
-            pthread_mutex_lock(&mutex_state);
-            G.pending_score  += pts;
-            G.match_pending   = true;
-            G.gravity_pending = true;
-            pthread_cond_signal(&cond_match_ready);
-            pthread_mutex_unlock(&mutex_state);
-
-            // Notifica al hilo de gravedad
-            pthread_cond_signal(&cond_gravity_ready);
-
+        if (found) {
+            pthread_mutex_lock(&mutex_game);
+            g_pending_pts  += pts;
+            g_match_ready   = true;
+            g_need_gravity  = true;
+            pthread_cond_signal(&cond_match);
+            pthread_cond_signal(&cond_grav);
+            pthread_mutex_unlock(&mutex_game);
             sem_post(&sem_render);
-        } else {
-            pthread_mutex_unlock(&mutex_board);
         }
 
-        usleep(150000);   // revisa cada 150 ms
+        usleep(150000);
     }
     return NULL;
 }
 
 // ============================================================
-//  HILO 5: GRAVEDAD – hace caer los dulces
+//  HILO 5: GRAVEDAD
 // ============================================================
-void* thread_gravity_fn(void* arg) {
+static void* thread_gravity_fn(void*) {
     while (true) {
-        pthread_mutex_lock(&mutex_state);
-        while (!G.gravity_pending && G.running)
-            pthread_cond_wait(&cond_gravity_ready, &mutex_state);
-        if (!G.running) {
-            pthread_mutex_unlock(&mutex_state);
+        pthread_mutex_lock(&mutex_game);
+        while (!g_need_gravity && g_running)
+            pthread_cond_wait(&cond_grav, &mutex_game);
+        if (!g_running && !g_need_gravity) {
+            pthread_mutex_unlock(&mutex_game);
             break;
         }
-        G.gravity_pending = false;
-        pthread_mutex_unlock(&mutex_state);
+        g_need_gravity = false;
+        pthread_mutex_unlock(&mutex_game);
 
         pthread_mutex_lock(&mutex_board);
-        // Para cada columna, empuja espacios hacia arriba
-        for (int j = 0; j < BOARD_COLS; j++) {
-            for (int i = BOARD_ROWS - 1; i > 0; i--) {
-                if (G.board[i][j] == ' ') {
-                    // busca el primer dulce encima
-                    for (int k = i - 1; k >= 0; k--) {
-                        if (G.board[k][j] != ' ') {
-                            G.board[i][j] = G.board[k][j];
-                            G.board[k][j] = ' ';
+        for (int j=0;j<COLS;j++)
+            for (int i=ROWS-1;i>0;i--)
+                if (board[i][j] == EMPTY)
+                    for (int k=i-1;k>=0;k--)
+                        if (board[k][j] != EMPTY) {
+                            board[i][j] = board[k][j];
+                            board[k][j] = EMPTY;
                             break;
                         }
-                    }
-                }
-            }
-        }
         pthread_mutex_unlock(&mutex_board);
 
-        // Marca relleno pendiente
-        pthread_mutex_lock(&mutex_state);
-        G.refill_pending = true;
-        G.match_pending  = false;
-        pthread_mutex_unlock(&mutex_state);
+        pthread_mutex_lock(&mutex_game);
+        g_need_refill = true;
+        pthread_mutex_unlock(&mutex_game);
 
         sem_post(&sem_render);
         usleep(100000);
@@ -370,23 +293,24 @@ void* thread_gravity_fn(void* arg) {
 }
 
 // ============================================================
-//  HILO 6: RELLENO – genera nuevos dulces en la fila superior
+//  HILO 6: RELLENO
 // ============================================================
-void* thread_refill_fn(void* arg) {
+static void* thread_refill_fn(void*) {
     while (true) {
-        pthread_mutex_lock(&mutex_state);
-        bool need = G.refill_pending && G.running;
-        if (need) G.refill_pending = false;
-        pthread_mutex_unlock(&mutex_state);
+        pthread_mutex_lock(&mutex_game);
+        bool alive = g_running;
+        bool need  = g_need_refill;
+        if (need) g_need_refill = false;
+        pthread_mutex_unlock(&mutex_game);
+
+        if (!alive) break;
 
         if (need) {
             pthread_mutex_lock(&mutex_board);
-            for (int j = 0; j < BOARD_COLS; j++) {
-                for (int i = 0; i < BOARD_ROWS; i++) {
-                    if (G.board[i][j] == ' ')
-                        G.board[i][j] = rand_candy(G.num_candy_types);
-                }
-            }
+            for (int i=0;i<ROWS;i++)
+                for (int j=0;j<COLS;j++)
+                    if (board[i][j] == EMPTY)
+                        board[i][j] = rand_candy();
             pthread_mutex_unlock(&mutex_board);
             sem_post(&sem_render);
         }
@@ -396,117 +320,81 @@ void* thread_refill_fn(void* arg) {
 }
 
 // ============================================================
-//  HILO 4: RENDERIZADO
+//  HILO 4: RENDER
 // ============================================================
-
-void print_candy(char c) {
-    int idx = candy_index(c);
-    if (c == SPECIAL_CHAR) {
-        printf("%s%s%c%s", BOLD, YELLOW, SPECIAL_CHAR, RESET);
-    } else if (idx >= 0) {
-        printf("%s%s%c%s", BOLD, CANDY_COLOR[idx], c, RESET);
-    } else {
-        printf("%s %s", BG_BLACK, RESET);
-    }
+static void print_candy(char c) {
+    if (c == SPC_CANDY) { printf("%s%sX%s", BOLD, C_YEL, RST); return; }
+    for (int k=0;k<7;k++)
+        if (c == CSYM[k]) { printf("%s%s%c%s", BOLD, CCOL[k], c, RST); return; }
+    printf(" ");
 }
 
-void draw_board() {
+static void draw_board() {
     pthread_mutex_lock(&mutex_board);
-    pthread_mutex_lock(&mutex_score);
+    // Leer estado bajo mutex_game
+    pthread_mutex_lock(&mutex_game);
+    int  score = g_score, moves = g_moves;
+    int  cr    = g_cr,    cc    = g_cc;
+    int  sr    = g_sr,    sc    = g_sc;
+    bool sel   = g_selected;
+    pthread_mutex_unlock(&mutex_game);
 
-    move_cursor(1, 1);
+    gotoxy(1,1);
+    printf("%s╔══════════════════════════════════════════════╗%s\n", C_CYN, RST);
+    printf("%s║%s  🍬  CANDY CRUSH - CC3086 UVG  🍬             %s║%s\n", C_CYN,BOLD,C_CYN,RST);
+    printf("%s╠══════════════════════════════════════════════╣%s\n", C_CYN, RST);
+    printf("%s║%s  Jugador: %-12s  Modo: %-5s           %s║%s\n",
+           C_CYN,C_WHT, g_name, g_mode==1?"EASY":"HARD", C_CYN,RST);
+    printf("%s║%s  Puntaje:%s%-5d%s  Movimientos:%s%-3d%s  Meta:%s%-4d%s %s║%s\n",
+           C_CYN,C_WHT, C_YEL,score,C_WHT, C_GRN,moves,C_WHT,
+           C_MAG,SCORE_GOAL,C_WHT, C_CYN,RST);
+    printf("%s╠══════════════════════════════════════════════╣%s\n", C_CYN, RST);
+    printf("%s║%s    ", C_CYN, C_WHT);
+    for (int j=0;j<COLS;j++) printf("  %d ", j);
+    printf("  %s║%s\n", C_CYN,RST);
+    printf("%s║%s  ┌", C_CYN, C_WHT);
+    for (int j=0;j<COLS;j++) printf("────");
+    printf("┐ %s║%s\n", C_CYN,RST);
 
-    // Encabezado
-    printf("%s╔══════════════════════════════════════════════╗%s\n", CYAN, RESET);
-    printf("%s║%s   🍬  CANDY CRUSH  -  CC3086  UVG  🍬         %s║%s\n", CYAN, BOLD, CYAN, RESET);
-    printf("%s╠══════════════════════════════════════════════╣%s\n", CYAN, RESET);
-    printf("%s║%s  Jugador: %-12s  Modo: %-6s          %s║%s\n",
-           CYAN, WHITE,
-           G.player_name,
-           (G.mode == 1 ? "EASY" : "HARD"),
-           CYAN, RESET);
-    printf("%s║%s  Puntaje: %s%-5d%s  Movimientos: %s%-3d%s  Meta: %s%-5d%s %s║%s\n",
-           CYAN, WHITE,
-           YELLOW, G.score, WHITE,
-           GREEN,  G.moves, WHITE,
-           MAGENTA, SCORE_GOAL, WHITE,
-           CYAN, RESET);
-    printf("%s╠══════════════════════════════════════════════╣%s\n", CYAN, RESET);
-
-    // Índices columna
-    printf("%s║%s    ", CYAN, WHITE);
-    for (int j = 0; j < BOARD_COLS; j++)
-        printf("  %d ", j);
-    printf(" %s║%s\n", CYAN, RESET);
-    printf("%s║%s  ┌", CYAN, WHITE);
-    for (int j = 0; j < BOARD_COLS; j++) printf("────");
-    printf("┐ %s║%s\n", CYAN, RESET);
-
-    for (int i = 0; i < BOARD_ROWS; i++) {
-        printf("%s║%s %d│", CYAN, WHITE, i);
-        for (int j = 0; j < BOARD_COLS; j++) {
-            // Cursor
-            bool is_cursor   = (i == G.cursor_r && j == G.cursor_c);
-            bool is_selected = (G.selected && i == G.sel_r && j == G.sel_c);
-
-            if (is_selected)
-                printf("%s[", GREEN);
-            else if (is_cursor)
-                printf("%s(", YELLOW);
-            else
-                printf(" ");
-
-            print_candy(G.board[i][j]);
-
-            if (is_selected)
-                printf("%s]", GREEN);
-            else if (is_cursor)
-                printf("%s)", YELLOW);
-            else
-                printf(" ");
+    for (int i=0;i<ROWS;i++) {
+        printf("%s║%s %d│", C_CYN,C_WHT,i);
+        for (int j=0;j<COLS;j++) {
+            bool isCur = (i==cr && j==cc);
+            bool isSel = (sel && i==sr && j==sc);
+            printf("%s", isSel ? C_GRN : (isCur ? C_YEL : C_WHT));
+            printf("%s", isSel ? "[" : (isCur ? "(" : " "));
+            print_candy(board[i][j]);
+            printf("%s", isSel ? "]" : (isCur ? ")" : " "));
         }
-        printf("%s│ %s║%s\n", WHITE, CYAN, RESET);
+        printf("%s│ %s║%s\n", C_WHT, C_CYN, RST);
     }
 
-    printf("%s║%s  └", CYAN, WHITE);
-    for (int j = 0; j < BOARD_COLS; j++) printf("────");
-    printf("┘ %s║%s\n", CYAN, RESET);
+    printf("%s║%s  └", C_CYN,C_WHT);
+    for (int j=0;j<COLS;j++) printf("────");
+    printf("┘ %s║%s\n", C_CYN,RST);
+    printf("%s╠══════════════════════════════════════════════╣%s\n", C_CYN,RST);
+    printf("%s║%s  Dulces: ", C_CYN,C_WHT);
+    for (int k=0;k<g_ncandy;k++) printf("%s%c%s ", CCOL[k],CSYM[k],RST);
+    printf("  %s%sX%s=Especial           %s║%s\n", BOLD,C_YEL,RST,C_CYN,RST);
+    printf("%s║%s  [WASD] Mover  [Esp] Sel/Swap  [Q] Salir    %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s╚══════════════════════════════════════════════╝%s\n", C_CYN,RST);
 
-    // Leyenda de dulces
-    printf("%s╠══════════════════════════════════════════════╣%s\n", CYAN, RESET);
-    printf("%s║%s  Dulces: ", CYAN, WHITE);
-    for (int k = 0; k < G.num_candy_types; k++) {
-        printf("%s%c%s ", CANDY_COLOR[k], CANDY_CHAR[k], RESET);
-    }
-    printf("%s%c%s=Especial", BOLD, SPECIAL_CHAR, RESET);
-    // Rellenar hasta el borde
-    printf("              %s║%s\n", CYAN, RESET);
-
-    printf("%s╠══════════════════════════════════════════════╣%s\n", CYAN, RESET);
-    printf("%s║%s  [W/A/S/D] Mover  [Espacio] Sel/Swap  [Q] Salir %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s╚══════════════════════════════════════════════╝%s\n", CYAN, RESET);
-
-    pthread_mutex_unlock(&mutex_score);
     pthread_mutex_unlock(&mutex_board);
     fflush(stdout);
 }
 
-void* thread_render_fn(void* arg) {
+static void* thread_render_fn(void*) {
     while (true) {
-        // Espera señal del semáforo (máx 200 ms de timeout)
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 200000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         sem_timedwait(&sem_render, &ts);
 
-        pthread_mutex_lock(&mutex_state);
-        bool alive = G.running;
-        pthread_mutex_unlock(&mutex_state);
-        if (!alive) break;
+        pthread_mutex_lock(&mutex_game);
+        bool alive = g_running;
+        pthread_mutex_unlock(&mutex_game);
+        if (!alive) break;   // salir sin dibujar más
 
         draw_board();
     }
@@ -514,364 +402,339 @@ void* thread_render_fn(void* arg) {
 }
 
 // ============================================================
-//  HILO 1: INPUT DEL JUGADOR
+//  HILO 1: INPUT
 // ============================================================
-void* thread_input_fn(void* arg) {
+static void* thread_input_fn(void*) {
     char ch;
     while (true) {
+        // read() con VTIME=1 → timeout 0.1s, nunca bloquea indefinidamente
         ssize_t n = read(STDIN_FILENO, &ch, 1);
-        if (n <= 0) { usleep(20000); continue; }
 
-        pthread_mutex_lock(&mutex_state);
-        if (!G.running) {
-            pthread_mutex_unlock(&mutex_state);
-            break;
-        }
+        // Revisar si el juego terminó (por victoria u otro hilo)
+        pthread_mutex_lock(&mutex_game);
+        bool alive = g_running;
+        pthread_mutex_unlock(&mutex_game);
+        if (!alive) break;
 
-        if (ch == KEY_QUIT) {
-            G.running   = false;
-            G.game_over = true;
-            pthread_cond_broadcast(&cond_match_ready);
-            pthread_cond_broadcast(&cond_gravity_ready);
-            pthread_mutex_unlock(&mutex_state);
+        if (n <= 0) continue;   // timeout, sin tecla
+
+        pthread_mutex_lock(&mutex_game);
+
+        if (ch == K_QUIT) {
+            g_running   = false;
+            g_game_over = true;
+            g_won       = false;
+            pthread_cond_broadcast(&cond_match);
+            pthread_cond_broadcast(&cond_grav);
+            pthread_mutex_unlock(&mutex_game);
             sem_post(&sem_render);
             break;
         }
 
-        // Movimiento del cursor
-        int nr = G.cursor_r, nc = G.cursor_c;
-        if      (ch == KEY_UP    && nr > 0)              nr--;
-        else if (ch == KEY_DOWN  && nr < BOARD_ROWS - 1) nr++;
-        else if (ch == KEY_LEFT  && nc > 0)              nc--;
-        else if (ch == KEY_RIGHT && nc < BOARD_COLS - 1) nc++;
+        // Mover cursor
+        if (ch==K_UP    && g_cr>0)      g_cr--;
+        if (ch==K_DOWN  && g_cr<ROWS-1) g_cr++;
+        if (ch==K_LEFT  && g_cc>0)      g_cc--;
+        if (ch==K_RIGHT && g_cc<COLS-1) g_cc++;
 
-        G.cursor_r = nr;
-        G.cursor_c = nc;
-
-        // Selección / intercambio
-        if (ch == KEY_SELECT) {
-            if (!G.selected) {
-                G.selected = true;
-                G.sel_r    = G.cursor_r;
-                G.sel_c    = G.cursor_c;
+        // Seleccionar / intercambiar
+        if (ch == K_SEL) {
+            if (!g_selected) {
+                g_selected = true;
+                g_sr = g_cr; g_sc = g_cc;
             } else {
-                int dr = abs(G.cursor_r - G.sel_r);
-                int dc = abs(G.cursor_c - G.sel_c);
-                // Solo adyacentes
-                if ((dr == 1 && dc == 0) || (dr == 0 && dc == 1)) {
+                int dr = abs(g_cr-g_sr), dc = abs(g_cc-g_sc);
+                if ((dr==1&&dc==0)||(dr==0&&dc==1)) {
                     pthread_mutex_lock(&mutex_board);
-                    swap_cells(G.sel_r, G.sel_c, G.cursor_r, G.cursor_c);
+                    char tmp = board[g_sr][g_sc];
+                    board[g_sr][g_sc] = board[g_cr][g_cc];
+                    board[g_cr][g_cc] = tmp;
                     pthread_mutex_unlock(&mutex_board);
-
-                    pthread_mutex_lock(&mutex_score);
-                    G.moves--;
-                    pthread_mutex_unlock(&mutex_score);
-
-                    if (G.moves <= 0) {
-                        G.game_over  = true;
-                        G.player_won = (G.score >= SCORE_GOAL);
-                        G.running    = false;
-                        pthread_cond_broadcast(&cond_match_ready);
-                        pthread_cond_broadcast(&cond_gravity_ready);
+                    g_moves--;
+                    if (g_moves <= 0 && !g_game_over) {
+                        g_game_over = true;
+                        g_won       = (g_score >= SCORE_GOAL);
+                        g_running   = false;
+                        pthread_cond_broadcast(&cond_match);
+                        pthread_cond_broadcast(&cond_grav);
                     }
                 }
-                G.selected = false;
+                g_selected = false;
             }
         }
 
-        // Check victoria
-        if (G.score >= SCORE_GOAL && !G.game_over) {
-            G.game_over  = true;
-            G.player_won = true;
-            G.running    = false;
-            pthread_cond_broadcast(&cond_match_ready);
-            pthread_cond_broadcast(&cond_gravity_ready);
-        }
-
-        pthread_mutex_unlock(&mutex_state);
+        pthread_mutex_unlock(&mutex_game);
         sem_post(&sem_render);
     }
     return NULL;
 }
 
 // ============================================================
-//  PANTALLAS DE MENÚ (sin hilos, secuencial)
+//  PANTALLAS
 // ============================================================
-
-void print_logo() {
-    printf("%s%s", BOLD, YELLOW);
-    printf("  ██████╗ █████╗ ███╗   ██╗██████╗ ██╗   ██╗\n");
-    printf(" ██╔════╝██╔══██╗████╗  ██║██╔══██╗╚██╗ ██╔╝\n");
-    printf(" ██║     ███████║██╔██╗ ██║██║  ██║ ╚████╔╝ \n");
-    printf(" ██║     ██╔══██║██║╚██╗██║██║  ██║  ╚██╔╝  \n");
-    printf(" ╚██████╗██║  ██║██║ ╚████║██████╔╝   ██║   \n");
-    printf("  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝    ╚═╝   \n");
-    printf("%s", RESET);
-    printf("%s%s", BOLD, RED);
-    printf("  ██████╗██████╗ ██╗   ██╗███████╗██╗  ██╗\n");
-    printf(" ██╔════╝██╔══██╗██║   ██║██╔════╝██║  ██║\n");
-    printf(" ██║     ██████╔╝██║   ██║███████╗███████║\n");
-    printf(" ██║     ██╔══██╗██║   ██║╚════██║██╔══██║\n");
-    printf(" ╚██████╗██║  ██║╚██████╔╝███████║██║  ██║\n");
-    printf("  ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝\n");
-    printf("%s\n", RESET);
-}
-
-void screen_menu() {
-    clear_screen();
-    print_logo();
-    printf("%s╔══════════════════════════════╗%s\n", CYAN, RESET);
-    printf("%s║%s        MENÚ PRINCIPAL        %s║%s\n", CYAN, BOLD, CYAN, RESET);
-    printf("%s╠══════════════════════════════╣%s\n", CYAN, RESET);
-    printf("%s║%s  1. Iniciar Partida          %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s  2. Instrucciones            %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s  3. Puntajes Destacados      %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s  4. Salir                    %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s╚══════════════════════════════╝%s\n", CYAN, RESET);
-    printf("\n  %sOpción:%s ", YELLOW, RESET);
+static void screen_menu() {
+    clrscr();
+    printf("%s%s", BOLD, C_YEL);
+    printf("   ██████╗ █████╗ ███╗  ██╗██████╗ ██╗   ██╗\n");
+    printf("  ██╔════╝██╔══██╗████╗ ██║██╔══██╗╚██╗ ██╔╝\n");
+    printf("  ██║     ███████║██╔██╗██║██║  ██║ ╚████╔╝ \n");
+    printf("  ╚██████╗██║  ██║██║╚████║██████╔╝   ██║   \n");
+    printf("   ╚═════╝╚═╝  ╚═╝╚═╝ ╚═══╝╚═════╝    ╚═╝   \n");
+    printf("%s%s", C_RED, RST);
+    printf("%s%s  ██████╗██████╗ ██╗   ██╗███████╗██╗  ██╗%s\n",BOLD,C_RED,RST);
+    printf("%s%s ██╔════╝██╔══██╗██║   ██║██╔════╝██║  ██║%s\n",BOLD,C_RED,RST);
+    printf("%s%s ██║     ██████╔╝██║   ██║███████╗███████║%s\n",BOLD,C_RED,RST);
+    printf("%s%s ╚██████╗██║  ██║╚██████╔╝███████║██║  ██║%s\n",BOLD,C_RED,RST);
+    printf("%s%s  ╚═════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝%s\n\n",BOLD,C_RED,RST);
+    printf("%s╔══════════════════════════════╗%s\n",C_CYN,RST);
+    printf("%s║%s      MENÚ PRINCIPAL          %s║%s\n",C_CYN,BOLD,C_CYN,RST);
+    printf("%s╠══════════════════════════════╣%s\n",C_CYN,RST);
+    printf("%s║%s  1. Iniciar Partida          %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s  2. Instrucciones            %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s  3. Puntajes Destacados      %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s  4. Salir                    %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s╚══════════════════════════════╝%s\n",C_CYN,RST);
+    printf("\n  %sOpción:%s ", C_YEL,RST);
     fflush(stdout);
 }
 
-void screen_instructions() {
-    clear_screen();
-    printf("%s%s╔══════════════════════════════════════════════╗%s\n", BOLD, CYAN, RESET);
-    printf("%s%s║               INSTRUCCIONES                  ║%s\n", BOLD, CYAN, RESET);
-    printf("%s%s╠══════════════════════════════════════════════╣%s\n", BOLD, CYAN, RESET);
-    printf("%s║%s                                              %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s  OBJETIVO: Alcanzar %s%d puntos%s antes de       %s║%s\n", CYAN, WHITE, YELLOW, SCORE_GOAL, WHITE, CYAN, RESET);
-    printf("%s║%s  agotar los movimientos disponibles.         %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s                                              %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s  CONTROLES:                                  %s║%s\n", CYAN, BOLD, CYAN, RESET);
-    printf("%s║%s   W / A / S / D  →  Mover cursor            %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   [Espacio]       →  Seleccionar / Confirmar %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   Q               →  Salir al menú           %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s                                              %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s  CÓMO JUGAR:                                 %s║%s\n", CYAN, BOLD, CYAN, RESET);
-    printf("%s║%s   1. Usa WASD para posicionar el cursor.     %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   2. Presiona ESPACIO para seleccionar       %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s      un dulce (aparece [X]).                 %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   3. Mueve el cursor al dulce adyacente y   %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s      presiona ESPACIO para intercambiar.     %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   4. Combinar 3+ iguales suma puntos.        %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   5. Combinar 4+ genera un dulce especial    %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s      (%s%cX%s) que elimina toda su fila.          %s║%s\n", CYAN, WHITE, YELLOW, SPECIAL_CHAR, WHITE, CYAN, RESET);
-    printf("%s║%s                                              %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s  PUNTAJE:                                    %s║%s\n", CYAN, BOLD, CYAN, RESET);
-    printf("%s║%s   3 en línea  → 30 pts                      %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   4 en línea  → 40 pts + dulce especial     %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s   Especial    → +40 pts (toda la fila)      %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s║%s                                              %s║%s\n", CYAN, WHITE, CYAN, RESET);
-    printf("%s╚══════════════════════════════════════════════╝%s\n", CYAN, RESET);
-    printf("\n  Presiona %sENTER%s para volver...\n", YELLOW, RESET);
+static void screen_instructions() {
+    clrscr();
+    printf("%s%s╔══════════════════════════════════════════════╗%s\n",BOLD,C_CYN,RST);
+    printf("%s%s║               INSTRUCCIONES                  ║%s\n",BOLD,C_CYN,RST);
+    printf("%s%s╠══════════════════════════════════════════════╣%s\n",BOLD,C_CYN,RST);
+    printf("%s║%s  OBJETIVO: alcanzar %s%d pts%s antes de agotar   %s║%s\n",C_CYN,C_WHT,C_YEL,SCORE_GOAL,C_WHT,C_CYN,RST);
+    printf("%s║%s  los movimientos disponibles.                %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s                                              %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s  CONTROLES:                                  %s║%s\n",C_CYN,BOLD,C_CYN,RST);
+    printf("%s║%s   W/A/S/D   → mover cursor                  %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s   [Espacio] → seleccionar / confirmar swap   %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s   Q         → salir al menú                  %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s                                              %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s  PUNTAJE:                                    %s║%s\n",C_CYN,BOLD,C_CYN,RST);
+    printf("%s║%s   3 en línea → 30 pts                       %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
+    printf("%s║%s   4+ en línea → 40+ pts + dulce %sX%s especial %s║%s\n",C_CYN,C_WHT,C_YEL,C_WHT,C_CYN,RST);
+    printf("%s║%s   Especial %sX%s → elimina fila entera +40 pts  %s║%s\n",C_CYN,C_WHT,C_YEL,C_WHT,C_CYN,RST);
+    printf("%s╚══════════════════════════════════════════════╝%s\n",C_CYN,RST);
+    printf("\n  Presiona %sENTER%s para volver...\n",C_YEL,RST);
+    fflush(stdout);
 }
 
-void screen_scores() {
-    clear_screen();
-    printf("%s%s╔══════════════════════════════╗%s\n", BOLD, CYAN, RESET);
-    printf("%s%s║      PUNTAJES DESTACADOS     ║%s\n", BOLD, CYAN, RESET);
-    printf("%s%s╠══════════════════════════════╣%s\n", BOLD, CYAN, RESET);
-
-    ifstream f(SCOREBOARD);
+static void screen_scores() {
+    clrscr();
+    printf("%s%s╔══════════════════════════════╗%s\n",BOLD,C_CYN,RST);
+    printf("%s%s║     PUNTAJES DESTACADOS      ║%s\n",BOLD,C_CYN,RST);
+    printf("%s%s╠══════════════════════════════╣%s\n",BOLD,C_CYN,RST);
+    ifstream f(SCOREFILE);
     if (!f.is_open()) {
-        printf("%s║%s  (Sin registros aún)         %s║%s\n", CYAN, WHITE, CYAN, RESET);
+        printf("%s║%s  (sin registros aún)         %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
     } else {
-        string line;
-        int rank = 1;
-        while (getline(f, line) && rank <= 10) {
-            string display = line;
-            if ((int)display.size() > 28) display = display.substr(0, 28);
-            // Pad to 28 chars
-            while ((int)display.size() < 28) display += ' ';
-            printf("%s║%s  %d. %s%s║%s\n",
-                   CYAN, WHITE, rank,
-                   display.c_str(), CYAN, RESET);
+        string line; int rank=1;
+        while (getline(f,line) && rank<=10) {
+            string d = line;
+            while ((int)d.size()<28) d+=' ';
+            printf("%s║%s  %2d. %s%s║%s\n",C_CYN,C_WHT,rank,d.substr(0,28).c_str(),C_CYN,RST);
             rank++;
         }
-        f.close();
     }
-    printf("%s╚══════════════════════════════╝%s\n", CYAN, RESET);
-    printf("\n  Presiona %sENTER%s para volver...\n", YELLOW, RESET);
-}
-
-void save_score(const char* name, int score) {
-    ofstream f(SCOREBOARD, ios::app);
-    if (f.is_open()) {
-        f << name << " - " << score << " pts\n";
-        f.close();
-    }
-}
-
-void screen_game_over() {
-    clear_screen();
-    if (G.player_won) {
-        printf("%s%s\n", BOLD, GREEN);
-        printf("  ██╗   ██╗██╗ ██████╗ ████████╗ ██████╗ ██████╗ ██╗ █████╗ \n");
-        printf("  ██║   ██║██║██╔════╝ ╚══██╔══╝██╔═══██╗██╔══██╗██║██╔══██╗\n");
-        printf("  ██║   ██║██║██║         ██║   ██║   ██║██████╔╝██║███████║\n");
-        printf("  ╚██╗ ██╔╝██║██║         ██║   ██║   ██║██╔══██╗██║██╔══██║\n");
-        printf("   ╚████╔╝ ██║╚██████╗    ██║   ╚██████╔╝██║  ██║██║██║  ██║\n");
-        printf("    ╚═══╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝\n");
-        printf("%s", RESET);
-    } else {
-        printf("%s%s\n", BOLD, RED);
-        printf("  ██████╗  █████╗  ███╗   ███╗███████╗     ██████╗ ██╗   ██╗███████╗██████╗ \n");
-        printf("  ██╔════╝██╔══██╗████╗ ████║██╔════╝    ██╔═══██╗██║   ██║██╔════╝██╔══██╗\n");
-        printf("  ██║     ███████║██╔████╔██║█████╗      ██║   ██║██║   ██║█████╗  ██████╔╝\n");
-        printf("  ██║     ██╔══██║██║╚██╔╝██║██╔══╝      ██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗\n");
-        printf("  ╚██████╗██║  ██║██║ ╚═╝ ██║███████╗    ╚██████╔╝ ╚████╔╝ ███████╗██║  ██║\n");
-        printf("   ╚═════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝     ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝\n");
-        printf("%s", RESET);
-    }
-    printf("\n%s  Jugador: %s%s\n", WHITE, YELLOW, G.player_name);
-    printf("%s  Puntaje final: %s%d%s  (Meta: %d)\n", WHITE, YELLOW, G.score, RESET, SCORE_GOAL);
-    save_score(G.player_name, G.score);
-    printf("\n  Puntaje guardado en scoreboard.\n");
-    printf("\n  Presiona %sENTER%s para continuar...\n", GREEN, RESET);
+    printf("%s╚══════════════════════════════╝%s\n",C_CYN,RST);
+    printf("\n  Presiona %sENTER%s para volver...\n",C_YEL,RST);
     fflush(stdout);
 }
 
-// ============================================================
-//  FUNCIÓN PRINCIPAL DE JUEGO
-// ============================================================
-void play_game() {
-    // Inicializar estado
-    memset(&G, 0, sizeof(G));
-    G.cursor_r = 0; G.cursor_c = 0;
-    G.sel_r    = -1; G.sel_c = -1;
-    G.selected = false;
-    G.game_over  = false;
-    G.player_won = false;
-    G.running    = true;
-    G.match_pending   = false;
-    G.gravity_pending = false;
-    G.refill_pending  = false;
-    G.pending_score   = 0;
+static void save_score() {
+    ofstream f(SCOREFILE, ios::app);
+    if (f.is_open()) f << g_name << " - " << g_score << " pts\n";
+}
 
-    // Nombre y modo
+static void screen_end() {
+    // Llamada DESPUES de que todos los hilos terminaron.
+    showcur();
     term_restore();
-    clear_screen();
-    printf("%s  Ingresa tu nombre: %s", YELLOW, RESET);
-    fflush(stdout);
-    // Leer nombre con eco normal
-    struct termios cooked = orig_termios;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &cooked);
-    fgets(G.player_name, sizeof(G.player_name), stdin);
-    // Quitar newline
-    int len = strlen(G.player_name);
-    if (len > 0 && G.player_name[len-1] == '\n')
-        G.player_name[len-1] = '\0';
+    clrscr();
 
-    printf("\n%s  Selecciona modo:%s\n", YELLOW, RESET);
-    printf("  1. %sFácil%s  (tablero 8x8, 5 dulces, %d movimientos)\n", GREEN, RESET, EASY_MOVES);
-    printf("  2. %sDifícil%s (tablero 8x8, 7 dulces, %d movimientos)\n", RED, RESET, HARD_MOVES);
-    printf("  Opción: ");
+    if (g_won) {
+        printf("\n");
+        printf("%s%s", BOLD, C_YEL);
+        printf("  ╔══════════════════════════════════════════════════╗\n");
+        printf("  ║                                                  ║\n");
+        printf("  ║    ██╗   ██╗██╗ ██████╗████████╗ ██████╗ ██╗     ║\n");
+        printf("  ║    ██║   ██║██║██╔════╝╚══██╔══╝██╔═══██╗██║     ║\n");
+        printf("  ║    ██║   ██║██║██║        ██║   ██║   ██║██║     ║\n");
+        printf("  ║    ╚██╗ ██╔╝██║██║        ██║   ██║   ██║██║     ║\n");
+        printf("  ║     ╚████╔╝ ██║╚██████╗   ██║   ╚██████╔╝██║     ║\n");
+        printf("  ║      ╚═══╝  ╚═╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝     ║\n");
+        printf("  ║                                                  ║\n");
+        printf("%s", RST);
+        // Nombre del jugador centrado
+        char linebuf[96];
+        snprintf(linebuf, sizeof(linebuf), "  Felicitaciones, %s!", g_name);
+        int pad = (50 - (int)strlen(linebuf)) / 2;
+        if (pad < 0) pad = 0;
+        printf("%s%s  ║%*s%s%*s║%s\n", BOLD, C_GRN, pad,"", linebuf, 50-pad-(int)strlen(linebuf),"", RST);
+        printf("%s%s", BOLD, C_YEL);
+        printf("  ║                                                  ║\n");
+        printf("  ╚══════════════════════════════════════════════════╝\n");
+        printf("%s\n", RST);
+
+        // Barra de progreso
+        int bar = (g_score * 30) / SCORE_GOAL;
+        if (bar > 30) bar = 30;
+        printf("  %sPuntaje: [%s", C_WHT, C_GRN);
+        for (int i=0;i<bar;i++)  printf("█");
+        for (int i=bar;i<30;i++) printf("░");
+        printf("%s]  %s%d / %d pts%s\n\n", C_WHT, C_YEL, g_score, SCORE_GOAL, RST);
+        printf("  %s★ Puntaje guardado en el scoreboard ★%s\n\n", C_GRN, RST);
+
+    } else {
+        printf("\n");
+        printf("%s%s", BOLD, C_RED);
+        printf("  ╔══════════════════════════════════════════════════╗\n");
+        printf("  ║                                                  ║\n");
+        printf("  ║   ██████╗  █████╗ ███╗   ███╗███████╗           ║\n");
+        printf("  ║  ██╔════╝ ██╔══██╗████╗ ████║██╔════╝           ║\n");
+        printf("  ║  ██║  ███╗███████║██╔████╔██║█████╗             ║\n");
+        printf("  ║  ██║   ██║██╔══██║██║╚██╔╝██║██╔══╝             ║\n");
+        printf("  ║  ╚██████╔╝██║  ██║██║ ╚═╝ ██║███████╗           ║\n");
+        printf("  ║   ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝           ║\n");
+        printf("  ║                                                  ║\n");
+        printf("  ║   ██████╗ ██╗   ██╗███████╗██████╗              ║\n");
+        printf("  ║  ██╔═══██╗██║   ██║██╔════╝██╔══██╗             ║\n");
+        printf("  ║  ██║   ██║██║   ██║█████╗  ██████╔╝             ║\n");
+        printf("  ║  ██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗             ║\n");
+        printf("  ║  ╚██████╔╝ ╚████╔╝ ███████╗██║  ██║             ║\n");
+        printf("  ║   ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝             ║\n");
+        printf("  ║                                                  ║\n");
+        printf("  ╚══════════════════════════════════════════════════╝\n");
+        printf("%s\n", RST);
+
+        int bar = (g_score * 30) / SCORE_GOAL;
+        if (bar > 30) bar = 30;
+        printf("  %sPuntaje: [%s", C_WHT, C_RED);
+        for (int i=0;i<bar;i++)  printf("█");
+        for (int i=bar;i<30;i++) printf("░");
+        printf("%s]  %s%d / %d pts%s\n\n", C_WHT, C_YEL, g_score, SCORE_GOAL, RST);
+
+        int faltaron = SCORE_GOAL - g_score;
+        if (faltaron > 0)
+            printf("  %s¡Te faltaron %d pts para ganar!%s\n\n", C_MAG, faltaron, RST);
+    }
+
+    printf("  %sJugador:%s %-20s  %sModo:%s %s\n",
+           C_CYN, RST, g_name, C_CYN, RST, g_mode==1?"Facil":"Dificil");
+
+    save_score();
+    printf("\n  %s► Presiona ENTER para continuar...%s\n", C_GRN, RST);
     fflush(stdout);
+
+    // Vaciar teclas residuales del juego antes de leer ENTER
+    tcflush(STDIN_FILENO, TCIFLUSH);
     char buf[8];
     fgets(buf, sizeof(buf), stdin);
-    G.mode = (buf[0] == '2') ? 2 : 1;
-    G.moves          = (G.mode == 1) ? EASY_MOVES : HARD_MOVES;
-    G.num_candy_types = (G.mode == 1) ? NUM_CANDIES : NUM_CANDIES_H;
+}
+
+// ============================================================
+//  JUEGO
+// ============================================================
+static void play_game() {
+    // Reset estado
+    g_score=0; g_pending_pts=0;
+    g_running=true; g_game_over=false; g_won=false;
+    g_match_ready=false; g_need_gravity=false; g_need_refill=false;
+    g_cr=0; g_cc=0; g_sr=-1; g_sc=-1; g_selected=false;
+
+    // Pedir nombre y modo en modo cooked
+    term_restore();
+    clrscr();
+    printf("%s  Ingresa tu nombre:%s ", C_YEL,RST); fflush(stdout);
+    fgets(g_name, sizeof(g_name), stdin);
+    int nl = strlen(g_name);
+    if (nl>0 && g_name[nl-1]=='\n') g_name[nl-1]='\0';
+
+    printf("\n%s  Modo:%s 1=Fácil (%d mov, 5 dulces)  2=Difícil (%d mov, 7 dulces)\n  Opción: ",
+           C_YEL,RST, EASY_MOVES, HARD_MOVES);
+    fflush(stdout);
+    char buf[8]; fgets(buf, sizeof(buf), stdin);
+    g_mode   = (buf[0]=='2') ? 2 : 1;
+    g_moves  = (g_mode==1) ? EASY_MOVES : HARD_MOVES;
+    g_ncandy = (g_mode==1) ? N_CANDY_EASY : N_CANDY_HARD;
 
     srand((unsigned)time(NULL));
-    init_board(G.num_candy_types);
+    init_board();
 
-    // Modo raw para el juego
-    term_raw_mode();
-    hide_cursor();
-    clear_screen();
+    // Modo raw + pantalla limpia
+    term_raw();
+    hidecur();
+    clrscr();
 
-    // Inicializar semáforo
     sem_init(&sem_render, 0, 1);
 
-    // Crear hilos
-    pthread_t tid_input, tid_match, tid_score, tid_render, tid_gravity, tid_refill;
-    pthread_create(&tid_render,  NULL, thread_render_fn,  NULL);
-    pthread_create(&tid_input,   NULL, thread_input_fn,   NULL);
-    pthread_create(&tid_match,   NULL, thread_match_fn,   NULL);
-    pthread_create(&tid_score,   NULL, thread_score_fn,   NULL);
-    pthread_create(&tid_gravity, NULL, thread_gravity_fn, NULL);
-    pthread_create(&tid_refill,  NULL, thread_refill_fn,  NULL);
+    pthread_t t_render, t_input, t_match, t_score, t_grav, t_refill;
+    pthread_create(&t_render, NULL, thread_render_fn,  NULL);
+    pthread_create(&t_input,  NULL, thread_input_fn,   NULL);
+    pthread_create(&t_match,  NULL, thread_match_fn,   NULL);
+    pthread_create(&t_score,  NULL, thread_score_fn,   NULL);
+    pthread_create(&t_grav,   NULL, thread_gravity_fn, NULL);
+    pthread_create(&t_refill, NULL, thread_refill_fn,  NULL);
 
-    // Esperar a que el juego termine
-    pthread_join(tid_input,   NULL);
+    // Esperar hilo input (termina cuando g_running=false)
+    pthread_join(t_input, NULL);
 
-    // Señalizar cierre a todos los hilos bloqueados
-    pthread_mutex_lock(&mutex_state);
-    G.running = false;
-    pthread_cond_broadcast(&cond_match_ready);
-    pthread_cond_broadcast(&cond_gravity_ready);
-    pthread_mutex_unlock(&mutex_state);
-    sem_post(&sem_render);
+    // Garantizar que todos los hilos vean g_running=false y salgan
+    pthread_mutex_lock(&mutex_game);
+    g_running = false;
+    pthread_cond_broadcast(&cond_match);
+    pthread_cond_broadcast(&cond_grav);
+    pthread_mutex_unlock(&mutex_game);
+    // Despertar render y los hilos con sem
+    for (int i=0;i<4;i++) sem_post(&sem_render);
 
-    pthread_join(tid_match,   NULL);
-    pthread_join(tid_score,   NULL);
-    pthread_join(tid_gravity, NULL);
-    pthread_join(tid_refill,  NULL);
-    pthread_join(tid_render,  NULL);
+    pthread_join(t_match,  NULL);
+    pthread_join(t_score,  NULL);
+    pthread_join(t_grav,   NULL);
+    pthread_join(t_refill, NULL);
+    pthread_join(t_render, NULL);
 
     sem_destroy(&sem_render);
 
-    show_cursor();
-    term_restore();
-    screen_game_over();
-
-    // Esperar ENTER
-    char dummy[4];
-    fgets(dummy, sizeof(dummy), stdin);
+    // Todos los hilos terminaron → ahora es seguro mostrar pantalla final
+    screen_end();
 }
 
 // ============================================================
 //  MAIN
 // ============================================================
 int main() {
-    // Guardar terminal original
-    tcgetattr(STDIN_FILENO, &orig_termios);
-
-    int opt = 0;
+    tcgetattr(STDIN_FILENO, &orig_term);
+    int opt=0;
     do {
         screen_menu();
-        char buf[8];
-        // Leer con eco para el menú
-        struct termios cooked = orig_termios;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &cooked);
-        fgets(buf, sizeof(buf), stdin);
-        opt = buf[0] - '0';
-
-        switch (opt) {
-        case 1:
-            play_game();
-            break;
+        // Modo cooked para el menú
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
+        char buf[8]; fgets(buf, sizeof(buf), stdin);
+        opt = buf[0]-'0';
+        switch(opt) {
+        case 1: play_game(); break;
         case 2:
             screen_instructions();
-            {
-                struct termios cooked2 = orig_termios;
-                tcsetattr(STDIN_FILENO, TCSAFLUSH, &cooked2);
-                char d[4]; fgets(d, sizeof(d), stdin);
-            }
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
+            { char d[4]; fgets(d,sizeof(d),stdin); }
             break;
         case 3:
             screen_scores();
-            {
-                struct termios cooked2 = orig_termios;
-                tcsetattr(STDIN_FILENO, TCSAFLUSH, &cooked2);
-                char d[4]; fgets(d, sizeof(d), stdin);
-            }
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_term);
+            { char d[4]; fgets(d,sizeof(d),stdin); }
             break;
         case 4:
-            clear_screen();
-            printf("%s  ¡Hasta pronto! 🍬%s\n\n", YELLOW, RESET);
-            break;
-        default:
+            clrscr();
+            printf("%s  ¡Hasta pronto! 🍬%s\n\n",C_YEL,RST);
             break;
         }
-    } while (opt != 4);
+    } while(opt!=4);
 
-    // Destruir primitivas
     pthread_mutex_destroy(&mutex_board);
-    pthread_mutex_destroy(&mutex_score);
-    pthread_mutex_destroy(&mutex_state);
-    pthread_cond_destroy(&cond_match_ready);
-    pthread_cond_destroy(&cond_gravity_ready);
-
+    pthread_mutex_destroy(&mutex_game);
+    pthread_cond_destroy(&cond_match);
+    pthread_cond_destroy(&cond_grav);
     return 0;
 }
