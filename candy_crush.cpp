@@ -5,12 +5,7 @@
  * Universidad del Valle de Guatemala
  *
  * HILOS INDEPENDIENTES:
- * 1. thread_input    – Captura teclas del jugador
- * 2. thread_match    – Detecta combinaciones en el tablero
- * 3. thread_score    – Acumula el puntaje
- * 4. thread_render   – Redibuja el tablero en consola
- * 5. thread_gravity  – Hace caer dulces al haber huecos
- * 6. thread_refill   – Rellena con nuevos dulces
+ *v
  *
  * SINCRONIZACIÓN:
  * - mutex_board  : protege el tablero
@@ -38,7 +33,8 @@ using namespace std;
 // ── Dimensiones y reglas ────────────────────────────────────
 #define ROWS        8
 #define COLS        8
-#define SCORE_GOAL  100
+#define SCORE_GOAL_EASY  100
+#define SCORE_GOAL_HARD  200
 #define EASY_MOVES  20
 #define HARD_MOVES  12
 #define SCOREFILE   "scoreboard.txt"
@@ -92,6 +88,7 @@ static bool g_selected = false;
 
 static int  g_mode       = 1;
 static int  g_ncandy     = N_CANDY_EASY;
+static int  g_goal       = SCORE_GOAL_EASY;
 static char g_name[64]   = "Jugador";
 
 // ── Primitivas ───────────────────────────────────────────────
@@ -161,7 +158,7 @@ static void* thread_score_fn(void*) {
         if (pts > 0) {
             pthread_mutex_lock(&mutex_game);
             g_score += pts;
-            if (!g_game_over && g_score >= SCORE_GOAL) {
+            if (!g_game_over && g_score >= g_goal) {
                 g_won      = true;
                 g_game_over= true;
                 g_running  = false;
@@ -422,7 +419,7 @@ static void draw_board() {
     char score_s[32], moves_s[32], goal_s[32];
     snprintf(score_s, sizeof(score_s), "%d", score);
     snprintf(moves_s, sizeof(moves_s), "%d", moves);
-    snprintf(goal_s, sizeof(goal_s), "%d", SCORE_GOAL);
+    snprintf(goal_s, sizeof(goal_s), "%d", g_goal);
 
     int score_w = ((int)strlen(score_s) > 6) ? (int)strlen(score_s) : 6;
     int moves_w = ((int)strlen(moves_s) > 4) ? (int)strlen(moves_s) : 4;
@@ -571,7 +568,7 @@ static void* thread_input_fn(void*) {
                     g_moves--;
                     if (g_moves <= 0 && !g_game_over) {
                         g_game_over = true;
-                        g_won       = (g_score >= SCORE_GOAL);
+                        g_won       = (g_score >= g_goal);
                         g_running   = false;
                         pthread_cond_broadcast(&cond_match);
                         pthread_cond_broadcast(&cond_grav);
@@ -621,7 +618,7 @@ static void screen_instructions() {
     printf("%s%s╔══════════════════════════════════════════════╗%s\n",BOLD,C_CYN,RST);
     printf("%s%s║                INSTRUCCIONES                 ║%s\n",BOLD,C_CYN,RST);
     printf("%s%s╠══════════════════════════════════════════════╣%s\n",BOLD,C_CYN,RST);
-    printf("%s║%s  OBJETIVO: alcanzar %s%d pts%s antes de agotar   %s║%s\n",C_CYN,C_WHT,C_YEL,SCORE_GOAL,C_WHT,C_CYN,RST);
+    printf("%s║%s  OBJETIVO: alcanzar %s%d pts%s antes de agotar   %s║%s\n",C_CYN,C_WHT,C_YEL,g_goal,C_WHT,C_CYN,RST);
     printf("%s║%s  los movimientos disponibles.                 %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
     printf("%s║%s                                               %s║%s\n",C_CYN,C_WHT,C_CYN,RST);
     printf("%s║%s  CONTROLES:                                   %s║%s\n",C_CYN,BOLD,C_CYN,RST);
@@ -693,12 +690,12 @@ static void screen_end() {
         printf("  ╚════════════════════════════════════════════════════════════════════╝\n");
         printf("%s\n", RST);
 
-        int bar = (g_score * 40) / SCORE_GOAL;
+        int bar = (g_score * 40) / g_goal;
         if (bar > 40) bar = 40;
         printf("  %sPuntaje Total: [%s", C_WHT, C_GRN);
         for (int i=0;i<bar;i++)  printf("█");
         for (int i=bar;i<40;i++) printf("░");
-        printf("%s]  %s%d / %d pts%s\n\n", C_WHT, C_YEL, g_score, SCORE_GOAL, RST);
+        printf("%s]  %s%d / %d pts%s\n\n", C_WHT, C_YEL, g_score, g_goal, RST);
         printf("  %s★ ¡Récord inmortalizado en el tablero de puntuaciones! ★%s\n\n", C_GRN, RST);
 
     } else {
@@ -716,14 +713,14 @@ static void screen_end() {
         printf("  ╚═════════════════════════════════════════════════════════════════════════════════════╝\n");
         printf("%s\n", RST);
 
-        int bar = (g_score * 40) / SCORE_GOAL;
+        int bar = (g_score * 40) / g_goal;
         if (bar > 40) bar = 40;
         printf("  %sPuntaje Total: [%s", C_WHT, C_RED);
         for (int i=0;i<bar;i++)  printf("█");
         for (int i=bar;i<40;i++) printf("░");
-        printf("%s]  %s%d / %d pts%s\n\n", C_WHT, C_YEL, g_score, SCORE_GOAL, RST);
+        printf("%s]  %s%d / %d pts%s\n\n", C_WHT, C_YEL, g_score, g_goal, RST);
 
-        int faltaron = SCORE_GOAL - g_score;
+        int faltaron = g_goal - g_score;
         if (faltaron > 0)
             printf("  %s¡Te quedaste a tan solo %d puntos de la gloria!%s\n\n", C_MAG, faltaron, RST);
     }
@@ -788,6 +785,7 @@ static void play_game() {
     g_mode   = (buf[0]=='2') ? 2 : 1;
     g_moves  = (g_mode==1) ? EASY_MOVES : HARD_MOVES;
     g_ncandy = (g_mode==1) ? N_CANDY_EASY : N_CANDY_HARD;
+    g_goal   = (g_mode==1) ? SCORE_GOAL_EASY : SCORE_GOAL_HARD;
 
     clrscr();
     printf("\n\n");
@@ -799,7 +797,7 @@ static void play_game() {
            g_mode==1 ? "FÁCIL" : "DIFÍCIL", RST,
            BOLD, C_CYN, RST);
     printf("  %s%s║%s  %s%d movimientos · Meta: %d pts%s                %s%s║%s\n",
-           BOLD, C_CYN, RST, C_WHT, g_moves, SCORE_GOAL, RST, BOLD, C_CYN, RST);
+           BOLD, C_CYN, RST, C_WHT, g_moves, g_goal, RST, BOLD, C_CYN, RST);
     printf("  %s%s║%s  %sCargando tablero...%s                          %s%s║%s\n",
            BOLD, C_CYN, RST, C_MAG, RST, BOLD, C_CYN, RST);
     printf("  %s%s╚══════════════════════════════════════════════╝%s\n\n", BOLD, C_CYN, RST);
